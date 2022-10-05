@@ -15,8 +15,8 @@ from pyqtgraph import PlotWidget, plot
 # All the process in this program:
 # 1. MainUI Process: UI QThread and Message QThread
 # 2. BackgroundManager Process: handle signal and params from UI, refactor results from DataRecver to plots
-# 2. DataRecver Process: grab data from FPGA FIFO and do basic manipulation
-# 3. FileManager Process: store data taken from DataRecver
+# 3. DataRecver Process: grab data from FPGA FIFO and do basic manipulation
+# 4. FileManager Process: store data taken from DataRecver
 
 class CVParams:
     cv_param_low_v = 0.0
@@ -65,6 +65,9 @@ def _FPGAManager(q_list):
         vec_y = np.array([])
         # preset calculations
         rampw_us = int(abs(param_dict['high_v'] - param_dict['low_v']) / param_dict['segment_res'] / param_dict['scan_vps'] * 1e6)
+        # data_buffer
+        data_buffer = np.empty((1,2), dtype=float)
+        is_buffer_nonempty = False
         # FPGA session
         with nifpga.Session(bitfile='FPGATarget_fscv.lvbitx', resource='RIO0') as session:
             session.reset()
@@ -100,15 +103,6 @@ def _FPGAManager(q_list):
                         halt = True
                     if msg['sender'] == 'MyApp_Messenger' and msg['command'] == 'exit':
                         main_ui_on_running = False
-                if fpga_finished or halt or (not main_ui_on_running):
-                    session_STOP_ctrl.write(True)
-                    QtCore.QThread.msleep(100)
-                    session.close()
-                    print('session closed')
-                    if fpga_finished or halt:
-                        q_list[0].put({'sender':'FPGAManager', 'command':'done', 'data':None})
-                        q_list[3].put({'sender':'FPGAManager', 'command':'halt', 'data':None})
-                    break
                 # data from target-to-host FIFO
                 probe_ret = session_TTH_FIFO.read(0, timeout_ms=0)
                 if probe_ret.elements_remaining > 0:
@@ -118,13 +112,35 @@ def _FPGAManager(q_list):
                     data_arr = np.asarray(data_ret.data, dtype='float')
                     # reshape
                     data_reshaped = np.reshape(data_arr, (extract_num//2, 2))
-                    vec_x = np.asarray(data_reshaped[:, 0])/5.0
-                    vec_y = np.asarray(data_reshaped[:, 1])*1e-9
-                    plot_vec_x = plot_vec_crop(np.concatenate((plot_vec_x, vec_x)))
-                    plot_vec_y = plot_vec_crop(np.concatenate((plot_vec_y, vec_y)))
+                    data_reshaped[:, 0] /= 5.0
+                    data_reshaped[:, 1] *= 1e-9
+                    plot_vec_x = plot_vec_crop(np.concatenate((plot_vec_x, np.asarray(data_reshaped[:, 0]))))
+                    plot_vec_y = plot_vec_crop(np.concatenate((plot_vec_y, np.asarray(data_reshaped[:, 1]))))
+                    data_buffer = np.concatenate((data_buffer, data_reshaped))
+                    is_buffer_nonempty = True
                     # send data to parallel processes
-                    q_list[3].put({'sender':'FPGAManager', 'command':'save', 'data':data_reshaped})
                     q_list[0].put({'sender':'FPGAManager', 'command':'draw', 'data':(plot_vec_x, plot_vec_y)})
+                    # send large data chunks instead of small ones to the pipe
+                    if data_buffer.nbytes > 65536*2:
+                        data_buffer = np.delete(data_buffer, obj=0, axis=0)
+                        q_list[3].put({'sender':'FPGAManager', 'command':'save', 'data':data_buffer})
+                        data_buffer = np.empty((1,2), dtype=float)
+                        is_buffer_nonempty = False
+                if fpga_finished or halt or (not main_ui_on_running):
+                    session_STOP_ctrl.write(True)
+                    QtCore.QThread.msleep(100)
+                    session.close()
+                    print('session closed')
+                    if fpga_finished or halt:
+                        # flush data in data buffer
+                        if is_buffer_nonempty:
+                            data_buffer = np.delete(data_buffer, obj=0, axis=0)
+                            q_list[3].put({'sender':'FPGAManager', 'command':'save', 'data':data_buffer})
+                            print('FGPA squeezed data into file')
+                        # halt notifier
+                        q_list[0].put({'sender':'FPGAManager', 'command':'done', 'data':None})
+                        q_list[3].put({'sender':'FPGAManager', 'command':'halt', 'data':None})
+                    break
                 QtCore.QThread.msleep(50)
         if not main_ui_on_running:
             break
@@ -139,16 +155,15 @@ def plot_vec_crop(arr):
 def _FileManager(q_list):
     # File Manager uses queue_list[3]
     print('FileManager PID: ' + str(os.getpid()))
-    data_path = './data_file.csv'
     main_ui_on_running = True
     while True:
         msg = q_list[3].get()
         if msg['sender'] == 'MyApp_Messenger' and msg['command'] == 'exit':
             main_ui_on_running = False
             break
-        if msg['sender'] == 'MyApp_Messenger' and msg['command'] != 'trigger':
+        if (msg['sender'] != 'MyApp_Messenger') or (msg['sender'] == 'MyApp_Messenger' and msg['command'] != 'trigger'):
             continue
-        with open(data_path, 'w', newline='') as csv_handle:
+        with open(msg['data'], 'w', newline='') as csv_handle:
             csv_writer = csv.writer(csv_handle, delimiter=',')
             # data buffer
             data_buffer = np.empty((1,2), dtype=float)
@@ -163,6 +178,7 @@ def _FileManager(q_list):
                         data_buffer = np.concatenate((data_buffer, msg['data']))
                         is_buffer_nonempty = True
                     if is_buffer_nonempty and frame_timer <= 0:
+                        data_buffer = np.delete(data_buffer, obj=0, axis=0)
                         csv_writer.writerows(data_buffer)
                         data_buffer = np.empty((1,2), dtype=float)
                         frame_timer = frame_timer_reset
@@ -170,14 +186,16 @@ def _FileManager(q_list):
                         print('data written')
                     if msg['sender'] == 'FPGAManager' and msg['command'] == 'halt':
                         if is_buffer_nonempty:
+                            data_buffer = np.delete(data_buffer, obj=0, axis=0)
                             csv_writer.writerows(data_buffer)
-                            print('data written')
+                            print('data halt (FPGA) written')
                         is_buffer_nonempty = False
                         break
                     if msg['sender'] == 'MyApp_Messenger' and msg['command'] == 'halt':
                         if is_buffer_nonempty:
+                            data_buffer = np.delete(data_buffer, obj=0, axis=0)
                             csv_writer.writerows(data_buffer)
-                            print('data written')
+                            print('data halt (Messenger) written')
                         is_buffer_nonempty = False
                         break
                     if msg['sender'] == 'MyApp_Messenger' and msg['command'] == 'exit':
@@ -292,6 +310,9 @@ class MyApp(QWidget):
             self.is_routine_running = False
             self.Btn_Run.setText('Run')
         else:
+            # trigger File Manager
+            self.messenger.queue_list[3].put({'sender':'MyApp_Messenger', 'command':'trigger', 'data':self.lineEdit_filepath.text()})
+            # trigger FPGA Manager
             low_v = float(self.lineEdit_param_low_v.text())
             high_v = float(self.lineEdit_param_high_v.text())
             init_v = float(self.lineEdit_param_init_v.text())
